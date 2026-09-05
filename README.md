@@ -26,7 +26,7 @@ Install Samba first. Avahi is optional and only handles mDNS advertisement on th
 
 ```bash
 sudo apt update
-sudo apt install -y samba avahi-daemon
+sudo apt install -y samba smbclient avahi-daemon
 ```
 
 If you use Avahi, restrict it to the LAN-facing interface so Docker and other virtual interfaces do not advertise misleading addresses:
@@ -47,6 +47,8 @@ Edit `/etc/samba/smb.conf` and make sure the global section defines the short Sa
    workgroup = WORKGROUP
    server string = SharedMovies server
    netbios name = <SAMBA_HOST_SHORT>
+   interfaces = lo <LAN_INTERFACE>
+   bind interfaces only = yes
    map to guest = never
 
 [SharedMovies]
@@ -59,6 +61,8 @@ Edit `/etc/samba/smb.conf` and make sure the global section defines the short Sa
    create mask = 0664
    directory mask = 0775
 ```
+
+The interface binding keeps Samba and NetBIOS discovery on the LAN instead of advertising through VPN, Tailscale, Docker, or other virtual adapters. Those adapters can leave stale browser registrations when routes change. Keep `lo` in the list for local administration. If clients connect through a software hotspot, add its interface to the list as well.
 
 Some installations also keep a small amount of tuning under `[global]`, such as `use sendfile = yes`, `socket options = TCP_NODELAY IPTOS_LOWDELAY`, or `deadtime = 0`. Treat those as optional. First confirm that the basic share works without them.
 
@@ -78,9 +82,12 @@ Keep authenticated access as the default. Switch to anonymous read/write access 
 
 With this mode, any LAN client that can reach the share can read files, add files, modify files, and delete files. That is convenient for a private network, but it removes per-user access control for this share.
 
-Use this share-level delta and leave the rest of the default example unchanged:
+Replace `map to guest = never` in the global section and apply the share-level changes below:
 
 ```ini
+[global]
+   map to guest = bad user
+
 [SharedMovies]
    guest ok = yes
    force user = <GUEST_FORCE_USER>
@@ -105,7 +112,16 @@ sudo systemctl restart smbd nmbd
 sudo systemctl restart avahi-daemon
 ```
 
-If you did not enable Avahi, only the Samba restart is required. Once `testparm` passes and the services are restarted, the server side is ready. The later VLC section can then add `<SAMBA_HOST_SHORT>`, sign in with `<SAMBA_USERNAME>`, and browse `SharedMovies`.
+If you did not enable Avahi, only the Samba restart is required. You can then test the LAN address and short server name from the Linux host:
+
+```bash
+nmblookup <SAMBA_HOST_SHORT>
+smbclient -I <LAN_IPV4> -L //<SAMBA_HOST_SHORT> -N
+smbclient -I <LAN_IPV4> //<SAMBA_HOST_SHORT>/SharedMovies -N -c 'ls'
+```
+
+The `-I` argument makes this self-test use the LAN address. Some Linux systems map their own short hostname to a loopback address in `/etc/hosts`, which is different from the name resolution used by another device on the LAN. For an authenticated share, omit `-N` and use `-U <SAMBA_USERNAME>` instead. Once these checks pass, the server side is ready.
+
 ## Part 2: Fire TV VLC manual SMB entry
 
 With the server name, `SharedMovies` share, and Samba credentials already set on the Linux side, move to the Fire TV Stick and add the connection manually in VLC.
@@ -135,6 +151,7 @@ By contrast, if you selected the optional guest-writable server mode in setup be
 Whichever entry matches the server mode you chose in setup, save it and then open `SharedMovies` to confirm that the share is reachable. If your VLC build keeps saved network locations in **Favorites**, the server should appear there after you save it. If the save works but the connection, server name, credentials, or share discovery still fails, continue with the Troubleshooting section before changing playback settings.
 
 If the share opens and playback is the only problem, adjust VLC only after the connection is already working. Under **Settings** > **Extra settings** > **Video**, try **Hardware acceleration** on **Disabled** or **Automatic** if video freezes while audio continues. Under **Settings** > **Advanced**, increase **Network caching** if playback stutters on an established stream. These playback settings are for freeze or buffering issues after connection, not for login failures, name-resolution problems, or a missing share.
+
 ## Troubleshooting and security notes
 
 After the Fire TV client setup, match the symptom before changing anything else.
@@ -154,8 +171,21 @@ If the share does not open or VLC rejects the login, work through these checks i
 9. Verify that the Fire TV device and the Samba host can actually reach each other on the LAN. The same SSID does not prove peer reachability.
 10. If devices appear to be on the same Wi-Fi but still cannot talk, check AP or client isolation, guest-network rules, repeater or mesh segmentation, and any other policy that blocks local peer traffic.
 11. Check UFW only if it is active. If it is disabled, skip firewall changes.
-12. If you are troubleshooting name discovery, keep Avahi scoped to the active LAN interface `<LAN_INTERFACE>` and avoid advertising Docker or other virtual interfaces.
+12. If you are troubleshooting name discovery, keep both Avahi and Samba scoped to the active LAN interface `<LAN_INTERFACE>`. VPN, Tailscale, Docker, and stale hotspot interfaces should not advertise the share.
 13. If your router keeps changing the host address and that complicates recovery, set a DHCP reservation as a fallback for stable address assignment. Keep `<SAMBA_HOST_SHORT>` as the normal VLC server value rather than treating the reservation as a replacement for the short Samba name.
+
+### If the share appears and disappears
+
+First check which interface carries the LAN address:
+
+```bash
+ip -brief address
+testparm -s | grep -E 'interfaces|bind interfaces only'
+```
+
+The Samba output should list `lo` and the active LAN interface, with `bind interfaces only = Yes`. If `log.nmbd` contains repeated `Network is unreachable` messages for VPN, Docker, or old network ranges, correct the interface list and restart `smbd` and `nmbd`.
+
+A software hotspot created on the same Wi-Fi adapter can briefly reset that adapter. Starting or stopping the hotspot will interrupt active SMB sessions even when the Samba configuration is correct. Wait for the LAN interface to settle, restart Samba if discovery does not return, and reconnect from VLC.
 
 ### If VLC connects but playback freezes or stutters
 
